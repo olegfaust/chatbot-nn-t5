@@ -1,2 +1,2 @@
 # chatbot-nn
-Neura network for chatbot
+Neural network for chatbot
