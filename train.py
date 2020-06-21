@@ -35,6 +35,12 @@ def create_trainer(hparams) -> 'pl.Trainer':
         checkpoint_callback=checkpoint_callback,
     )
 
+    if hparams.use_16bit:
+        train_params["use_amp"] = hparams.use_16bit
+
+    if hparams.gpus > 1:
+        train_params["distributed_backend"] = hparams.distributed_backend
+
     trainer = pl.Trainer(**train_params)
 
     return trainer
@@ -85,6 +91,15 @@ def add_general_args(arg_parser):
         default=1,
         help='how many gpus to be used'
     )
+    # default distributed_backend is set to DDP as it is much faster:
+    # as DDP only performs 1 transfer to sync gradients whereas
+    # DP performs three GPU transfers for EVERY batch
+    parent_parser.add_argument(
+        '--distributed_backend',
+        type=str,
+        default='ddp',
+        help='supports four options dp, ddp, ddp2, ddp_spawn'
+    )
     arg_parser.add_argument(
         '--use_16bit',
         dest='use_16bit',
@@ -99,7 +114,6 @@ if __name__ == '__main__':
     # ------------------------
     # these are project-wide arguments
 
-    root_dir = os.path.dirname(os.path.realpath(__file__))
     parent_parser = ArgumentParser(add_help=False)
 
     # add general arguments

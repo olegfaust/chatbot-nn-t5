@@ -4,6 +4,7 @@ T5 model for question answering
 
 import torch
 import argparse
+import os
 
 from torch import optim
 from torch.utils.data import DataLoader
@@ -137,7 +138,14 @@ class T5QaModel(LightningModule):
 
     def get_dataloader(self, type_path: str, batch_size: int, shuffle: bool = False) -> DataLoader:
         dataset = QaDataset(self.tokenizer, type_path=type_path, **self.dataset_kwargs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=dataset.collate_fn, shuffle=shuffle)
+        num_workers = 2
+        if os.name == 'nt':
+            # there are problems with parallelizing DataLoader on Windows
+            # see https://github.com/pytorch/pytorch/issues/12831
+            num_workers = 0
+
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=dataset.collate_fn, shuffle=shuffle,
+                                num_workers=num_workers, pin_memory=True)
         return dataloader
 
     def configure_optimizers(self):
@@ -164,7 +172,7 @@ class T5QaModel(LightningModule):
 
     def val_dataloader(self) -> DataLoader:
         log.info('Validation data loader called.')
-        return self.get_dataloader("val", batch_size=self.hparams.eval_batch_size)
+        return self.get_dataloader("validation", batch_size=self.hparams.eval_batch_size)
 
     def test_dataloader(self) -> DataLoader:
         log.info('Test data loader called.')
@@ -244,12 +252,12 @@ class T5QaModel(LightningModule):
 
         parser.add_argument(
             "--train_batch_size",
-            default=32,
+            default=8,
             type=int
         )
         parser.add_argument(
             "--eval_batch_size",
-            default=32,
+            default=8,
             type=int
         )
 
