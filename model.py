@@ -1,114 +1,123 @@
 """
-Example template for defining a system.
+T5 model for question answering
 """
-import os
-from argparse import ArgumentParser
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
+import argparse
+
 from torch import optim
 from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
 
 from pytorch_lightning import _logger as log
 from pytorch_lightning.core import LightningModule
 
+from transformers import T5Config, T5Tokenizer, T5ForConditionalGeneration
 
-class LightningTemplateModel(LightningModule):
+from dataset import QaDataset
+
+
+class T5QaModel(LightningModule):
     """
-    Sample model to show how to define a template.
-    Example:
-        >>> # define simple Net for MNIST dataset
-        >>> params = dict(
-        ...     drop_prob=0.2,
-        ...     batch_size=2,
-        ...     in_features=28 * 28,
-        ...     learning_rate=0.001 * 8,
-        ...     optimizer_name='adam',
-        ...     data_root='./datasets',
-        ...     out_features=10,
-        ...     hidden_dim=1000,
-        ... )
-        >>> model = LightningTemplateModel(**params)
+    T5 model for question answering
     """
 
     def __init__(self,
-                 drop_prob: float = 0.2,
-                 batch_size: int = 2,
-                 in_features: int = 28 * 28,
-                 learning_rate: float = 0.001 * 8,
-                 optimizer_name: str = 'adam',
-                 data_root: str = './datasets',
-                 out_features: int = 10,
-                 hidden_dim: int = 1000,
-                 **kwargs
-                 ) -> 'LightningTemplateModel':
+                 hparams: argparse.Namespace,
+                 num_labels=None,
+                 **config_kwargs
+                 ) -> 'T5QaModel':
         # init superclass
         super().__init__()
-        self.drop_prob = drop_prob
-        self.batch_size = batch_size
-        self.in_features = in_features
-        self.learning_rate = learning_rate
-        self.optimizer_name = optimizer_name
-        self.data_root = data_root
-        self.out_features = out_features
-        self.hidden_dim = hidden_dim
+        self.hparams = hparams
+        cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
+        self.config = T5Config.from_pretrained(
+            self.hparams.config_name if self.hparams.config_name else self.hparams.model_name_or_path,
+            **({"num_labels": num_labels} if num_labels is not None else {}),
+            cache_dir=cache_dir,
+            **config_kwargs,
+        )
+        self.tokenizer = T5Tokenizer.from_pretrained(
+            self.hparams.tokenizer_name if self.hparams.tokenizer_name else self.hparams.model_name_or_path,
+            cache_dir=cache_dir,
+        )
+        self.model = T5ForConditionalGeneration.from_pretrained(
+            self.hparams.model_name_or_path,
+            from_tf=bool(".ckpt" in self.hparams.model_name_or_path),
+            config=self.config,
+            cache_dir=cache_dir,
+        )
+        self.dataset_kwargs: dict = dict(
+            data_dir=self.hparams.input_dir,
+            max_source_length=1024,
+            max_target_length=56,
+        )
 
-        self.c_d1 = nn.Linear(in_features=self.in_features,
-                              out_features=self.hidden_dim)
-        self.c_d1_bn = nn.BatchNorm1d(self.hidden_dim)
-        self.c_d1_drop = nn.Dropout(self.drop_prob)
-
-        self.c_d2 = nn.Linear(in_features=self.hidden_dim,
-                              out_features=self.out_features)
-
-        self.example_input_array = torch.zeros(2, 1, 28, 28)
-
-    def forward(self, x):
+    def forward(self, input_ids, attention_mask=None, decoder_input_ids=None, lm_labels=None):
         """
         No special modification required for Lightning, define it as you normally would
         in the `nn.Module` in vanilla PyTorch.
         """
-        x = self.c_d1(x.view(x.size(0), -1))
-        x = torch.tanh(x)
-        x = self.c_d1_bn(x)
-        x = self.c_d1_drop(x)
-        x = self.c_d2(x)
-        return x
+        return self.model(
+            input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids, lm_labels=lm_labels,
+        )
+
+    def _step(self, batch):
+        pad_token_id = self.tokenizer.pad_token_id
+        source_ids, source_mask, y = batch["source_ids"], batch["source_mask"], batch["target_ids"]
+        y_ids = y[:, :-1].contiguous()
+        lm_labels = y[:, 1:].clone()
+        lm_labels[y[:, 1:] == pad_token_id] = -100
+        outputs = self(source_ids, attention_mask=source_mask, decoder_input_ids=y_ids, lm_labels=lm_labels,)
+
+        loss = outputs[0]
+
+        return loss
 
     def training_step(self, batch, batch_idx):
         """
         Lightning calls this inside the training loop with the data from the training dataloader
         passed in as `batch`.
         """
-        # forward pass
-        x, y = batch
-        y_hat = self(x)
-        loss = F.cross_entropy(y_hat, y)
-        tensorboard_logs = {'train_loss': loss}
-        return {'loss': loss, 'log': tensorboard_logs}
+        loss = self._step(batch)
+
+        tensorboard_logs = {"train_loss": loss}
+        return {"loss": loss, "log": tensorboard_logs}
 
     def validation_step(self, batch, batch_idx):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
         """
-        x, y = batch
-        y_hat = self(x)
-        val_loss = F.cross_entropy(y_hat, y)
-        labels_hat = torch.argmax(y_hat, dim=1)
-        n_correct_pred = torch.sum(y == labels_hat).item()
-        return {'val_loss': val_loss, "n_correct_pred": n_correct_pred, "n_pred": len(x)}
+        loss = self._step(batch)
+        return {"val_loss": loss}
+
+    def validation_end(self, outputs):
+        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        tensorboard_logs = {"val_loss": avg_loss}
+        return {"avg_val_loss": avg_loss, "log": tensorboard_logs}
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        test_loss = F.cross_entropy(y_hat, y)
-        labels_hat = torch.argmax(y_hat, dim=1)
-        n_correct_pred = torch.sum(y == labels_hat).item()
-        return {'test_loss': test_loss, "n_correct_pred": n_correct_pred, "n_pred": len(x)}
+        pad_token_id = self.tokenizer.pad_token_id
+        source_ids, source_mask, y = QaDataset.trim_seq2seq_batch(batch, pad_token_id)
+        # NOTE: the following kwargs get more speed and lower quality summaries than those in evaluate_cnn.py
+        generated_ids = self.model.generate(
+            input_ids=source_ids,
+            attention_mask=source_mask,
+            num_beams=1,
+            max_length=80,
+            repetition_penalty=2.5,
+            length_penalty=1.0,
+            early_stopping=True,
+            use_cache=True,
+        )
+        preds = [
+            self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            for g in generated_ids
+        ]
+        target = [self.tokenizer.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=True) for t in y]
+        loss = self._step(batch)
+
+        return {"val_loss": loss, "preds": preds, "target": target}
 
     def validation_epoch_end(self, outputs):
         """
@@ -126,62 +135,122 @@ class LightningTemplateModel(LightningModule):
         tensorboard_logs = {'test_loss': avg_loss, 'test_acc': test_acc}
         return {'test_loss': avg_loss, 'log': tensorboard_logs}
 
-    # ---------------------
-    # TRAINING SETUP
-    # ---------------------
+    def get_dataloader(self, type_path: str, batch_size: int, shuffle: bool = False) -> DataLoader:
+        dataset = QaDataset(self.tokenizer, type_path=type_path, **self.dataset_kwargs)
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=dataset.collate_fn, shuffle=shuffle)
+        return dataloader
+
     def configure_optimizers(self):
         """
         Return whatever optimizers and learning rate schedulers you want here.
         At least one optimizer is required.
         """
-        optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
         return [optimizer], [scheduler]
 
-    def prepare_data(self):
-        MNIST(self.data_root, train=True, download=True, transform=transforms.ToTensor())
-        MNIST(self.data_root, train=False, download=True, transform=transforms.ToTensor())
+    # def prepare_data(self):
+    #     MNIST(self.data_root, train=True, download=True, transform=transforms.ToTensor())
+    #     MNIST(self.data_root, train=False, download=True, transform=transforms.ToTensor())
+    #
+    # def setup(self, stage):
+    #     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (1.0,))])
+    #     self.mnist_train = MNIST(self.data_root, train=True, download=False, transform=transform)
+    #     self.mnist_test = MNIST(self.data_root, train=False, download=False, transform=transform)
 
-    def setup(self, stage):
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (1.0,))])
-        self.mnist_train = MNIST(self.data_root, train=True, download=False, transform=transform)
-        self.mnist_test = MNIST(self.data_root, train=False, download=False, transform=transform)
-
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
         log.info('Training data loader called.')
-        return DataLoader(self.mnist_train, batch_size=self.batch_size, num_workers=4)
+        return self.get_dataloader("train", batch_size=self.hparams.train_batch_size, shuffle=True)
 
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
         log.info('Validation data loader called.')
-        return DataLoader(self.mnist_test, batch_size=self.batch_size, num_workers=4)
+        return self.get_dataloader("val", batch_size=self.hparams.eval_batch_size)
 
-    def test_dataloader(self):
+    def test_dataloader(self) -> DataLoader:
         log.info('Test data loader called.')
-        return DataLoader(self.mnist_test, batch_size=self.batch_size, num_workers=4)
+        return self.get_dataloader("test", batch_size=self.hparams.eval_batch_size)
 
     @staticmethod
-    def add_model_specific_args(parent_parser, root_dir):  # pragma: no-cover
+    def add_model_specific_args(parser):  # pragma: no-cover
         """
         Define parameters that only apply to this model
         """
-        parser = ArgumentParser(parents=[parent_parser])
+        # Model specification
+        parser.add_argument(
+            "--model_name_or_path",
+            default=None,
+            type=str,
+            required=True,
+            help="path to pretrained model or model identifier from huggingface.co/models",
+        )
+        parser.add_argument(
+            "--config_name",
+            default="",
+            type=str,
+            help="pretrained config name or path if not the same as model_name"
+        )
+        parser.add_argument(
+            "--tokenizer_name",
+            default="",
+            type=str,
+            help="pretrained tokenizer name or path if not the same as model_name",
+        )
 
-        # param overwrites
-        # parser.set_defaults(gradient_clip_val=5.0)
+        # Cache settings
+        parser.add_argument(
+            "--cache_dir",
+            default="",
+            type=str,
+            help="where to store the pre-trained models downloaded from s3",
+        )
 
-        # network params
-        parser.add_argument('--in_features', default=28 * 28, type=int)
-        parser.add_argument('--out_features', default=10, type=int)
-        # use 500 for CPU, 50000 for GPU to see speed difference
-        parser.add_argument('--hidden_dim', default=50000, type=int)
-        parser.add_argument('--drop_prob', default=0.2, type=float)
-        parser.add_argument('--learning_rate', default=0.001, type=float)
+        # Optimizer settings
+        parser.add_argument(
+            "--max_grad_norm",
+            default=1.0,
+            type=float,
+            help="Max gradient norm.")
+        parser.add_argument(
+            "--gradient_accumulation_steps",
+            type=int,
+            default=1,
+            help="number of update steps to accumulate before performing a backward/update pass",
+        )
 
-        # data
-        parser.add_argument('--data_root', default=os.path.join(root_dir, 'mnist'), type=str)
+        parser.add_argument(
+            "--learning_rate",
+            default=5e-5,
+            type=float,
+            help="The initial learning rate for Adam."
+        )
+        parser.add_argument(
+            "--weight_decay",
+            default=0.0,
+            type=float,
+            help="Weight decay if we apply some."
+        )
+        parser.add_argument(
+            "--adam_epsilon",
+            default=1e-8,
+            type=float,
+            help="Epsilon for Adam optimizer."
+        )
+        parser.add_argument(
+            "--epochs",
+            default=3,
+            type=int,
+            help="Total number of training epochs to perform."
+        )
 
-        # training params (opt)
-        parser.add_argument('--epochs', default=20, type=int)
-        parser.add_argument('--optimizer_name', default='adam', type=str)
-        parser.add_argument('--batch_size', default=64, type=int)
+        parser.add_argument(
+            "--train_batch_size",
+            default=32,
+            type=int
+        )
+        parser.add_argument(
+            "--eval_batch_size",
+            default=32,
+            type=int
+        )
+
         return parser
