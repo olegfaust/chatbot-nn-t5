@@ -21,21 +21,28 @@ def export(out_data_dir: str, split_type: str, src_data_dir=None):
         for item in squad_dataset:
             # *** write concatenated source text (= question + context) ***
 
-            # remove newline symbols as they are present in "context" (why?)
-            context_text = item["question"] + " \\n " + item["context"].replace('\r', '').replace('\n', '') + '\n'
-            # convert to lowercase targets and context texts as uppercase words (at least some of them) ...
-            # ... are not present in vocabulary (for instance "France" is absent, but there is "france" instead)
+            # remove newline symbols as they are present in "context" text (why?)
+            context_text = item["question"] + " \\n " + item["context"].replace('\r', '').replace('\n', '')
+            if not context_text.endswith('.'):
+                context_text = context_text + '.' + '</s>\n'
+            else:
+                context_text = context_text + '</s>\n'
+
+            # convert to lowercase targets and context texts as some uppercase words are not present...
+            # ... in vocabulary (for instance "France" is absent, but, surprisingly, there is "france" instead)
+            # Remark: seems like T5Tokenizer from transformers library is broken now ...
+            # ... (it also incorrectly works with eos symbol and there are many other weird things)
             context_file.write(context_text.lower())
 
             # *** write target text (= correct answer) ***
             answers = item["answers"]["text"]
+            # Important!!! add end of sentence '</s>' symbol ...
+            # ... to avoid exception due to empty sequence (inside t5 model code)
             if answers:
-                # add "<answer>" at the beginning of answer to guarantee it contains at least one known word
-                target_text = "<answer> " + answers[0] + '\n'
+                target_text = answers[0].lower() + '. </s>' + '\n'
             else:
-                # replace empty strings with "<no answer>" to avoid exception in t5 model code
-                target_text = "<no answer>" + '\n'
-            target_file.write(target_text.lower())
+                target_text = '. </s>' + '\n'
+            target_file.write(target_text)
             progress.update()
 
 

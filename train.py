@@ -94,7 +94,7 @@ def add_general_args(arg_parser):
     # default distributed_backend is set to DDP as it is much faster:
     # as DDP only performs 1 transfer to sync gradients whereas
     # DP performs three GPU transfers for EVERY batch
-    parent_parser.add_argument(
+    arg_parser.add_argument(
         '--distributed_backend',
         type=str,
         default='ddp',
