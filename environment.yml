@@ -1,0 +1,18 @@
+name: chatbot-nn
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.7
+  - pip
+  - pytorch=1.5.1
+  - pip:
+    - numpy==1.19
+    - tqdm==4.46
+    - termcolor==1.1
+    - colorama==0.4
+    - torch==1.5.1
+    - transformers==2.11
+    - nlp==0.3
+    - pytorch_lightning==0.8
