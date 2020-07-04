@@ -68,6 +68,12 @@ if __name__ == '__main__':
         # answer question
         input_ids = tokenizer.encode(question, return_tensors="pt")
         res = model.generate(input_ids)
-        answer = [tokenizer.decode(x) for x in res]
+
+        #answer = [tokenizer.decode(x) for x in res]
+        #answer = tokenizer.batch_decode(res, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+        # to remove "trash" at the end of generated answer
+        answer = tokenizer.batch_decode(res)[0].split("[EOS]", 1)[0]
+
         # print answer
         print(colored("A:>", "yellow"), colored(answer, "green"))

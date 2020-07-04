@@ -15,4 +15,5 @@ dependencies:
     - torch==1.5.1
     - transformers==2.11
     - nlp==0.3
-    - pytorch_lightning==0.8
+    - pytorch_lightning==0.8.1
+    - rouge-score==0.0.4

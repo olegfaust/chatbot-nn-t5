@@ -5,6 +5,9 @@ T5 model for question answering
 import torch
 import argparse
 import os
+import numpy as np
+
+from typing import Callable, Dict, Iterable, List
 
 from torch import optim
 from torch.utils.data import DataLoader
@@ -15,6 +18,16 @@ from pytorch_lightning.core import LightningModule
 from transformers import T5Config, T5Tokenizer, T5ForConditionalGeneration
 
 from dataset import QaDataset
+
+from rouge_score import rouge_scorer, scoring
+
+
+ROUGE_KEYS = ["rouge1", "rouge2", "rougeL"]
+
+
+def lmap(f: Callable, x: Iterable) -> List:
+    """list(map(f, x))"""
+    return list(map(f, x))
 
 
 class T5QaModel(LightningModule):
@@ -27,7 +40,6 @@ class T5QaModel(LightningModule):
                  num_labels=None,
                  **config_kwargs
                  ) -> 'T5QaModel':
-        # init superclass
         super().__init__()
         self.hparams = hparams
         cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
@@ -47,11 +59,22 @@ class T5QaModel(LightningModule):
             config=self.config,
             cache_dir=cache_dir,
         )
+
+        # fix for eos token id problem
+        # see https://github.com/huggingface/transformers/issues/5142 for more info on the problem and workaround
+        if self.tokenizer.eos_token_id == 1:
+            self.tokenizer.add_special_tokens({'eos_token': '[EOS]'})
+            self.model.resize_token_embeddings(len(self.tokenizer))
+
         self.dataset_kwargs: dict = dict(
             data_dir=self.hparams.input_dir,
             max_source_length=1024,
             max_target_length=56,
         )
+
+        self.loss_names = ["loss"]
+        self.metric_names = ROUGE_KEYS
+        self.val_metric = "rouge2"
 
     def forward(self, input_ids, attention_mask=None, decoder_input_ids=None, lm_labels=None):
         """
@@ -61,6 +84,12 @@ class T5QaModel(LightningModule):
         return self.model(
             input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids, lm_labels=lm_labels,
         )
+
+    def ids_to_clean_text(self, generated_ids: List[int]):
+        gen_text = self.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+        )
+        return lmap(str.strip, gen_text)
 
     def _step(self, batch):
         pad_token_id = self.tokenizer.pad_token_id
@@ -72,30 +101,41 @@ class T5QaModel(LightningModule):
 
         loss = outputs[0]
 
-        return loss
+        return (loss,)
+
+    def _generative_step(self, batch: dict) -> dict:
+        pad_token_id = self.tokenizer.pad_token_id
+        source_ids, source_mask, y = QaDataset.trim_seq2seq_batch(batch, pad_token_id)
+        generated_ids = self.model.generate(input_ids=source_ids, attention_mask=source_mask, use_cache=True, )
+        preds = self.ids_to_clean_text(generated_ids)
+        target = self.ids_to_clean_text(y)
+        loss_tensors = self._step(batch)
+        base_metrics = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
+        rouge: Dict = T5QaModel.calculate_rouge(preds, target)
+        summ_len = np.mean(lmap(len, generated_ids))
+        base_metrics.update(summ_len=summ_len, preds=preds, target=target, **rouge)
+        return base_metrics
 
     def training_step(self, batch, batch_idx):
         """
         Lightning calls this inside the training loop with the data from the training dataloader
         passed in as `batch`.
         """
-        loss = self._step(batch)
-
-        tensorboard_logs = {"train_loss": loss}
-        return {"loss": loss, "log": tensorboard_logs}
+        loss_tensors = self._step(batch)
+        logs = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
+        return {"loss": loss_tensors[0], "log": logs}
 
     def validation_step(self, batch, batch_idx):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
         """
-        loss = self._step(batch)
-        return {"val_loss": loss}
+        return self._generative_step(batch)
 
     def validation_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        tensorboard_logs = {"val_loss": avg_loss}
-        return {"avg_val_loss": avg_loss, "log": tensorboard_logs}
+        avg_loss = torch.stack([x["loss"] for x in outputs]).mean()
+        tensorboard_logs = {"loss": avg_loss}
+        return {"avg_loss": avg_loss, "log": tensorboard_logs}
 
     def test_step(self, batch, batch_idx):
         pad_token_id = self.tokenizer.pad_token_id
@@ -157,15 +197,6 @@ class T5QaModel(LightningModule):
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
         return [optimizer], [scheduler]
 
-    # def prepare_data(self):
-    #     MNIST(self.data_root, train=True, download=True, transform=transforms.ToTensor())
-    #     MNIST(self.data_root, train=False, download=True, transform=transforms.ToTensor())
-    #
-    # def setup(self, stage):
-    #     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (1.0,))])
-    #     self.mnist_train = MNIST(self.data_root, train=True, download=False, transform=transform)
-    #     self.mnist_test = MNIST(self.data_root, train=False, download=False, transform=transform)
-
     def train_dataloader(self) -> DataLoader:
         log.info('Training data loader called.')
         return self.get_dataloader("train", batch_size=self.hparams.train_batch_size, shuffle=True)
@@ -177,6 +208,18 @@ class T5QaModel(LightningModule):
     def test_dataloader(self) -> DataLoader:
         log.info('Test data loader called.')
         return self.get_dataloader("test", batch_size=self.hparams.eval_batch_size)
+
+    @staticmethod
+    def calculate_rouge(output_lns: List[str], reference_lns: List[str]) -> Dict:
+        scorer = rouge_scorer.RougeScorer(ROUGE_KEYS, use_stemmer=True)
+        aggregator = scoring.BootstrapAggregator()
+
+        for reference_ln, output_ln in zip(reference_lns, output_lns):
+            scores = scorer.score(reference_ln, output_ln)
+            aggregator.add_scores(scores)
+
+        result = aggregator.aggregate()
+        return {k: v.mid.fmeasure for k, v in result.items()}
 
     @staticmethod
     def add_model_specific_args(parser):  # pragma: no-cover
